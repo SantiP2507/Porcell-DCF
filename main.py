@@ -1,53 +1,37 @@
 """
-main.py — Entry point for the DCF Valuation & Research Engine.
+main.py — CLI entry point for the DCF Valuation & Research Engine.
 
 Usage:
-  # Full analysis on a single ticker
   python main.py --ticker AAPL
-
-  # Full analysis with sensitivity heatmap
-  python main.py --ticker AAPL --sensitivity
-
-  # Daily screener across a watchlist
-  python main.py --screen --tickers AAPL MSFT GOOG AMZN META NVDA
-
-  # Screener with sensitivity for each candidate
-  python main.py --screen --tickers AAPL MSFT GOOG --sensitivity
-
-  # Custom scenario overrides
+  python main.py --ticker MSFT --sensitivity
   python main.py --ticker AAPL --base-growth 0.10 --base-wacc 0.09
-
-  # Verbose logging (show DEBUG output)
-  python main.py --ticker AAPL --verbose
-
-  # Show charts interactively (opens matplotlib window)
-  python main.py --ticker AAPL --show-charts
+  python main.py --screen
+  python main.py --screen --tickers AAPL MSFT NVDA
+  python main.py --ticker AAPL --save            # persist to Supabase
+  python main.py --clear-cache
+  python main.py --ticker AAPL --show-charts     # interactive display
 """
 
 import argparse
 import logging
 import sys
-from typing import List, Optional
+from datetime import date
+from typing import Optional, List
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SETUP (must happen before other imports that use logging)
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _setup(verbose: bool):
-    """Configure logging before anything else."""
-    import logging
-    level = logging.DEBUG if verbose else logging.INFO
+def _setup_logging(verbose: bool):
+    level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
         level=level,
-        format="  %(levelname)-8s %(message)s",
+        format="  %(levelname)-8s %(name)s | %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    # Silence noisy libraries
-    for name in ["urllib3", "yfinance", "peewee", "requests", "matplotlib"]:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    # Silence noisy third-party loggers
+    for lib in ["urllib3", "yfinance", "requests", "matplotlib", "PIL"]:
+        logging.getLogger(lib).setLevel(logging.ERROR)
 
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("main")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,122 +42,169 @@ def analyze_ticker(
     ticker: str,
     run_sensitivity: bool = False,
     show_charts: bool = False,
+    make_charts: bool = True,
     scenario_overrides: Optional[dict] = None,
-) -> Optional[object]:  # returns ValuationSummary
+    save: bool = False,
+    years: Optional[int] = None,
+) -> Optional[object]:
     """
-    Full end-to-end analysis for one ticker:
-      1. Fetch data
-      2. Run DCF (3 scenarios)
-      3. Print reports
-      4. Compute sensitivity grid (optional)
-      5. Generate all charts
-      6. Persist to Supabase (if configured)
-
-    Returns the ValuationSummary, or None on failure.
+    Full end-to-end analysis pipeline for one ticker.
+    Returns ValuationSummary on success, None on failure.
     """
     from data.fetcher import fetch_all, validate_financials
     from valuation.scenarios import build_scenarios, summarize_scenarios
-    from valuation.sensitivity import compute_sensitivity_grid
-    from charts.plotter import plot_all
-    from supabase.client import save_valuation, save_market_snapshot
-    from utils.formatting import (
-        print_financial_snapshot,
-        print_valuation_report,
-        print_projected_fcfs,
-    )
+    from valuation.dcf import explain_result
+    from config import DCF_PROJECTION_YEARS
 
-    print(f"\n{'─'*60}")
-    print(f"  Analyzing: {ticker.upper()}")
-    print(f"{'─'*60}")
+    ticker = ticker.upper().strip()
+    print(f"\n{'─'*62}")
+    print(f"  Analyzing: {ticker}")
+    print(f"{'─'*62}")
 
-    # ── 1. Fetch Data ──────────────────────────────────────────────────────
+    # ── Step 1: Fetch ──────────────────────────────────────────────────────
+    print("  Fetching data...", end=" ", flush=True)
     try:
         market_data, financials = fetch_all(ticker)
-    except ValueError as e:
-        logger.error(f"Data fetch failed for {ticker}: {e}")
+        print("✓")
+    except Exception as e:
+        print(f"✗\n  Error: {e}")
         return None
 
-    # Print data quality warnings
+    # ── Step 2: Validate ───────────────────────────────────────────────────
     warnings = validate_financials(financials)
     for w in warnings:
-        print(f"\n  ⚠️  {w}")
+        print(f"  ⚠️  {w}")
 
-    # Print financial snapshot
-    print_financial_snapshot(financials, market_data)
+    # Summary line
+    net_debt_label = f"Net Debt: ${financials.net_debt:.0f}M" if financials.net_debt >= 0 else f"Net Cash: ${-financials.net_debt:.0f}M"
+    print(f"\n  Price:   ${market_data.price:.2f}  |  Mkt Cap: ${market_data.market_cap/1000:.1f}B")
+    print(f"  TTM FCF: ${financials.trailing_fcf:.0f}M  |  {net_debt_label}")
+    if financials.historical_fcf:
+        hist_str = "  ".join(f"${v:.0f}M" for v in financials.historical_fcf[-5:])
+        print(f"  FCF History ({len(financials.historical_fcf)}yr): {hist_str}")
 
-    # ── 2. Run DCF ─────────────────────────────────────────────────────────
+    # ── Step 3: Build Scenarios ────────────────────────────────────────────
+    projection_years = years or DCF_PROJECTION_YEARS
+    print(f"\n  Running DCF ({projection_years}-year horizon)...", end=" ", flush=True)
     try:
         summary = build_scenarios(
             financials=financials,
             market_data=market_data,
             overrides=scenario_overrides,
+            projection_years=projection_years,
         )
+        print("✓")
     except Exception as e:
-        logger.error(f"DCF engine failed for {ticker}: {e}")
+        print(f"✗\n  DCF error: {e}")
         return None
 
-    # ── 3. Print Reports ───────────────────────────────────────────────────
-    print_valuation_report(summary)
-    print_projected_fcfs(summary)
+    # ── Step 4: Print Results ─────────────────────────────────────────────
+    print(summarize_scenarios(summary))
 
-    # DCF explanation for each scenario
-    from valuation.dcf import explain_result
     for result in [summary.bear, summary.base, summary.bull]:
         if result and result.is_valid:
             print(explain_result(result, market_data.price))
 
-    # ── 4. Sensitivity Analysis ────────────────────────────────────────────
+    # ── Step 5: Sensitivity Analysis ──────────────────────────────────────
     sensitivity_data = None
     if run_sensitivity:
-        print(f"  Computing sensitivity grid for {ticker}...")
+        from valuation.sensitivity import (
+            compute_sensitivity_grid, grid_to_dataframe,
+            compute_implied_growth_rate,
+        )
+        print("  Computing sensitivity grid...", end=" ", flush=True)
         try:
             g_rates, d_rates, grid = compute_sensitivity_grid(financials, market_data)
-
-            from valuation.sensitivity import grid_to_dataframe, compute_implied_growth_rate
-            df = grid_to_dataframe(g_rates, d_rates, grid, market_data.price)
-
-            print(f"\n  SENSITIVITY ANALYSIS: {ticker}")
-            print(f"  Upside % vs Market Price (${market_data.price:.2f})")
-            print(f"  Rows = FCF Growth Rate | Cols = WACC\n")
-
-            # Format for console: multiply by 100 for display
-            display_df = df.applymap(lambda x: f"{x*100:+.0f}%" if x == x else "N/A")
-            try:
-                from tabulate import tabulate
-                print(tabulate(display_df, headers="keys", tablefmt="rounded_outline"))
-            except ImportError:
-                print(display_df.to_string())
-
-            # Implied growth rate
-            implied_g = compute_implied_growth_rate(financials, market_data)
-            if implied_g is not None:
-                print(
-                    f"\n  Market-Implied FCF Growth Rate (at base WACC): "
-                    f"{implied_g:.1%}"
-                )
-
             sensitivity_data = (g_rates, d_rates, grid)
+            print("✓")
+
+            df = grid_to_dataframe(g_rates, d_rates, grid, market_data.price)
+            print(f"\n  Sensitivity: {ticker} | Price: ${market_data.price:.2f} | Values = Upside %")
+            print(f"  {'Growth \\ WACC':<15}", end="")
+            for col in df.columns:
+                print(f"  {col:>8}", end="")
             print()
+            print(f"  {'─'*65}")
+            for idx, row in df.iterrows():
+                print(f"  {idx:<15}", end="")
+                for val in row:
+                    display = f"{val*100:+.0f}%" if val == val else "N/A"
+                    print(f"  {display:>8}", end="")
+                print()
 
+            implied = compute_implied_growth_rate(financials, market_data)
+            if implied is not None:
+                print(f"\n  Market-implied FCF growth rate: {implied:.1%}")
+            else:
+                print(f"\n  Market price implies growth > 50% — consider growth decomposition.")
         except Exception as e:
-            logger.error(f"Sensitivity analysis failed: {e}")
+            print(f"✗\n  Sensitivity error: {e}")
 
-    # ── 5. Charts ──────────────────────────────────────────────────────────
-    try:
-        chart_paths = plot_all(summary, sensitivity_data=sensitivity_data, show=show_charts)
-        if chart_paths:
-            print(f"  Charts saved:")
-            for p in chart_paths:
-                print(f"    → {p}")
-        print()
-    except Exception as e:
-        logger.error(f"Chart generation failed: {e}")
+    # ── Step 6: Charts ────────────────────────────────────────────────────
+    if make_charts:
+        print("\n  Generating charts...", end=" ", flush=True)
+        try:
+            from charts.plotter import plot_all
+            paths = plot_all(summary=summary, sensitivity_data=sensitivity_data, show=show_charts)
+            print(f"✓  ({len(paths)} charts)")
+            for p in paths:
+                print(f"    → {p.name}")
+        except Exception as e:
+            print(f"✗\n  Charts error: {e}")
 
-    # ── 6. Persist ─────────────────────────────────────────────────────────
-    save_valuation(summary)
-    save_market_snapshot(summary)
+    # ── Step 7: Persist ────────────────────────────────────────────────────
+    if save:
+        _persist_valuation(summary, financials)
 
     return summary
+
+
+def _persist_valuation(summary, financials):
+    """Save valuation results to Supabase."""
+    from db.supabase_client import (
+        save_valuation, save_market_snapshot, is_configured
+    )
+    if not is_configured():
+        print("\n  ⚠️  Supabase not configured (SUPABASE_URL / SUPABASE_KEY not set)")
+        return
+
+    print("\n  Saving to Supabase...", end=" ", flush=True)
+    assumptions = {
+        "trailing_fcf_m": financials.trailing_fcf,
+        "net_debt_m":     financials.net_debt,
+        "bear":  _scenario_assumptions(summary.bear),
+        "base":  _scenario_assumptions(summary.base),
+        "bull":  _scenario_assumptions(summary.bull),
+    }
+    ok = save_valuation(
+        ticker=summary.ticker,
+        valuation_date=date.today(),
+        bear_value=summary.bear.fair_value_per_share if summary.bear else None,
+        base_value=summary.base.fair_value_per_share if summary.base else None,
+        bull_value=summary.bull.fair_value_per_share if summary.bull else None,
+        market_price=summary.market_price,
+        terminal_value_pct=summary.base.terminal_value_pct if summary.base else None,
+        assumptions=assumptions,
+    )
+    save_market_snapshot(
+        ticker=summary.ticker,
+        snapshot_date=date.today(),
+        price=summary.market_price,
+        fcf=financials.trailing_fcf,
+        valuation_gap=summary.upside_base,
+    )
+    print("✓" if ok else "partial (market snapshot saved)")
+
+
+def _scenario_assumptions(result) -> Optional[dict]:
+    if result is None:
+        return None
+    return {
+        "fcf_growth_rate":     result.fcf_growth_rate,
+        "discount_rate":       result.discount_rate,
+        "terminal_growth_rate": result.terminal_growth_rate,
+        "projection_years":    result.projection_years,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,58 +213,65 @@ def analyze_ticker(
 
 def run_screener(
     tickers: List[str],
-    run_sensitivity: bool = False,
+    top_n: int = 10,
     show_charts: bool = False,
+    make_charts: bool = True,
+    save: bool = False,
 ) -> None:
-    """
-    Run DCF on all tickers, screen candidates, display ranked results,
-    generate screener chart, and persist to Supabase.
-    """
+    """Run DCF on all tickers, screen, rank, display, and optionally persist."""
+    from data.fetcher import fetch_all, validate_financials
+    from valuation.scenarios import build_scenarios
     from research.screener import screen_candidates, print_screener_results
-    from charts.plotter import plot_screener_ranking
-    from supabase.client import save_research_candidates
+    from config import DEFAULT_SCREEN_TICKERS
 
-    print(f"\n{'═'*60}")
-    print(f"  📊  DCF SCREENER — {len(tickers)} tickers")
-    print(f"{'═'*60}\n")
+    universe = tickers or DEFAULT_SCREEN_TICKERS
+    print(f"\n{'═'*62}")
+    print(f"  DCF DAILY SCREENER — {len(universe)} tickers")
+    print(f"{'═'*62}")
 
     summaries = []
-    for ticker in tickers:
-        summary = analyze_ticker(
-            ticker,
-            run_sensitivity=run_sensitivity,
-            show_charts=show_charts,
-        )
-        if summary:
+    failed = []
+
+    for i, ticker in enumerate(universe, 1):
+        print(f"  [{i:2d}/{len(universe)}] {ticker:<8}", end=" ", flush=True)
+        try:
+            market_data, financials = fetch_all(ticker)
+            summary = build_scenarios(financials=financials, market_data=market_data)
             summaries.append(summary)
+            upside = summary.upside_base
+            tag = f"Base: {upside:+.0%}" if upside is not None else "no base"
+            print(f"✓  {tag}")
+        except Exception as e:
+            failed.append(ticker)
+            print(f"✗  {str(e)[:50]}")
+
+    print(f"\n  Done: {len(summaries)} ok | {len(failed)} failed")
+    if failed:
+        print(f"  Failed: {', '.join(failed)}")
 
     if not summaries:
-        print("  No tickers could be analyzed.")
+        print("  No valid valuations — nothing to screen.")
         return
 
-    # Screen and rank
-    candidates = screen_candidates(summaries)
-
-    # Print results table
+    candidates = screen_candidates(summaries, top_n=top_n)
     print_screener_results(candidates)
 
-    # Screener chart
-    if candidates:
+    if make_charts and candidates:
         try:
+            from charts.plotter import plot_screener_ranking
             p = plot_screener_ranking(candidates, show=show_charts)
             if p:
-                print(f"  Screener chart saved: {p}\n")
+                print(f"  Screener chart: {p}")
         except Exception as e:
-            logger.error(f"Screener chart failed: {e}")
+            log.warning(f"Screener chart failed: {e}")
 
-    # Persist
-    save_research_candidates(candidates)
-
-    print(
-        f"  Screened {len(summaries)} tickers | "
-        f"{len(candidates)} candidates | "
-        f"Charts saved to {__import__('config').CHART_OUTPUT_DIR}\n"
-    )
+    if save and candidates:
+        from db.supabase_client import save_research_candidates_batch, is_configured
+        if is_configured():
+            n = save_research_candidates_batch(candidates)
+            print(f"\n  Saved {n}/{len(candidates)} candidates to Supabase")
+        else:
+            print("  ⚠️  Supabase not configured")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,117 +279,105 @@ def run_screener(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args():
-    parser = argparse.ArgumentParser(
+    p = argparse.ArgumentParser(
         description="DCF Valuation & Research Engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # Mode
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--ticker", "-t",
-        metavar="TICKER",
-        help="Analyze a single ticker (e.g. AAPL)",
-    )
-    group.add_argument(
-        "--screen", "-s",
-        action="store_true",
-        help="Run daily screener (requires --tickers)",
-    )
+    mode = p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--ticker", "-t", metavar="SYMBOL",
+                      help="Analyze a single ticker (e.g. AAPL)")
+    mode.add_argument("--screen", "-s", action="store_true",
+                      help="Run the daily research screener")
+    mode.add_argument("--clear-cache", action="store_true",
+                      help="Clear the local data cache")
 
-    # Ticker list for screener
-    parser.add_argument(
-        "--tickers",
-        nargs="+",
-        metavar="TICKER",
-        help="List of tickers for screener mode",
-    )
+    p.add_argument("--tickers", nargs="+", metavar="SYM",
+                   help="Custom ticker list for --screen (default: universe in config)")
+    p.add_argument("--top-n", type=int, default=10,
+                   help="Max candidates to return from screener (default: 10)")
 
-    # Analysis options
-    parser.add_argument(
-        "--sensitivity",
-        action="store_true",
-        help="Compute and display sensitivity heatmap",
-    )
-    parser.add_argument(
-        "--show-charts",
-        action="store_true",
-        help="Open charts interactively (requires display)",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Show debug logging",
-    )
+    p.add_argument("--sensitivity", action="store_true",
+                   help="Run sensitivity grid (FCF growth × WACC)")
+    p.add_argument("--years", type=int, default=None,
+                   help="Projection horizon override (default: 5)")
+    p.add_argument("--base-growth", type=float, metavar="RATE",
+                   help="Override base FCF growth rate, e.g. 0.10")
+    p.add_argument("--base-wacc", type=float, metavar="RATE",
+                   help="Override base discount rate (WACC), e.g. 0.09")
+    p.add_argument("--base-terminal", type=float, metavar="RATE",
+                   help="Override base terminal growth rate, e.g. 0.025")
 
-    # Custom scenario overrides
-    parser.add_argument(
-        "--base-growth",
-        type=float,
-        metavar="RATE",
-        help="Override base FCF growth rate (e.g. 0.10 = 10%%)",
-    )
-    parser.add_argument(
-        "--base-wacc",
-        type=float,
-        metavar="RATE",
-        help="Override base discount rate / WACC (e.g. 0.09 = 9%%)",
-    )
-    parser.add_argument(
-        "--base-terminal",
-        type=float,
-        metavar="RATE",
-        help="Override base terminal growth rate (e.g. 0.03 = 3%%)",
-    )
-    parser.add_argument(
-        "--years",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Override projection horizon (default: 5 years)",
-    )
+    p.add_argument("--save", action="store_true",
+                   help="Persist results to Supabase (requires credentials)")
+    p.add_argument("--show-charts", action="store_true",
+                   help="Display charts interactively (requires GUI)")
+    p.add_argument("--no-charts", action="store_true",
+                   help="Skip chart generation")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Enable verbose logging")
 
-    return parser.parse_args()
+    return p.parse_args()
 
+
+
+
+def _ensure_ml_models():
+    """Train ML models on first run, retrain weekly thereafter."""
+    try:
+        from ml.trainer import train_all, should_retrain, mark_retrained
+        if should_retrain():
+            print("  Initializing ML models (first run or weekly retrain)...")
+            train_all(force=False)
+            mark_retrained()
+            print("  ML models ready.")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"ML model setup failed (non-fatal): {e}")
 
 def main():
     args = _parse_args()
-    _setup(args.verbose)
+    _setup_logging(args.verbose)
+    _ensure_ml_models()
 
-    # Build scenario overrides from CLI flags
-    scenario_overrides = {}
-    base_override = {}
-    if args.base_growth is not None:
-        base_override["fcf_growth_rate"] = args.base_growth
-    if args.base_wacc is not None:
-        base_override["discount_rate"] = args.base_wacc
-    if args.base_terminal is not None:
-        base_override["terminal_growth_rate"] = args.base_terminal
-    if base_override:
-        scenario_overrides["base"] = base_override
+    if args.clear_cache:
+        from data.cache import cache_clear
+        cache_clear()
+        print("  ✓  Cache cleared.")
+        return
 
-    # ── Single ticker mode ─────────────────────────────────────────────────
     if args.ticker:
+        overrides = {}
+        base_ov = {}
+        if args.base_growth is not None:
+            base_ov["fcf_growth_rate"] = args.base_growth
+        if args.base_wacc is not None:
+            base_ov["discount_rate"] = args.base_wacc
+        if args.base_terminal is not None:
+            base_ov["terminal_growth_rate"] = args.base_terminal
+        if base_ov:
+            overrides["base"] = base_ov
+
         result = analyze_ticker(
             ticker=args.ticker,
             run_sensitivity=args.sensitivity,
             show_charts=args.show_charts,
-            scenario_overrides=scenario_overrides or None,
+            make_charts=not args.no_charts,
+            scenario_overrides=overrides or None,
+            save=args.save,
+            years=args.years,
         )
         sys.exit(0 if result else 1)
 
-    # ── Screener mode ──────────────────────────────────────────────────────
     if args.screen:
-        if not args.tickers:
-            print("  Error: --screen requires --tickers TICK1 TICK2 ...")
-            sys.exit(1)
         run_screener(
-            tickers=[t.upper() for t in args.tickers],
-            run_sensitivity=args.sensitivity,
+            tickers=[t.upper() for t in args.tickers] if args.tickers else None,
+            top_n=args.top_n,
             show_charts=args.show_charts,
+            make_charts=not args.no_charts,
+            save=args.save,
         )
-        sys.exit(0)
 
 
 if __name__ == "__main__":

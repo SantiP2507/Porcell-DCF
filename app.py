@@ -31,6 +31,7 @@ from flask import Flask, jsonify, request, send_from_directory
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 
 logging.basicConfig(level=logging.INFO, format="  %(levelname)s %(message)s")
 for lib in ["urllib3", "yfinance", "requests", "matplotlib", "werkzeug"]:
@@ -111,7 +112,7 @@ def analyze():
 
         # Persist
         try:
-            from supabase.client import save_valuation, save_market_snapshot
+            from db.supabase_client import save_valuation, save_market_snapshot
             save_valuation(summary)
             save_market_snapshot(summary)
         except Exception:
@@ -125,7 +126,6 @@ def analyze():
         implied_growth = None
         if run_sensitivity:
             g_rates, d_rates, grid = compute_sensitivity_grid(financials, market_data)
-            df = grid_to_dataframe(g_rates, d_rates, grid, market_data.price)
             sensitivity_data = {
                 "growth_rates": [f"{g:.0%}" for g in g_rates],
                 "discount_rates": [f"{d:.0%}" for d in d_rates],
@@ -138,7 +138,7 @@ def analyze():
                                    d_rates if run_sensitivity else None,
                                    grid if run_sensitivity else None)
 
-        return jsonify({
+        response_data = {
             "ticker": ticker,
             "price": market_data.price,
             "market_cap": market_data.market_cap,
@@ -160,7 +160,8 @@ def analyze():
             "implied_growth": implied_growth,
             "ml": ml_data,
             "charts": charts,
-        })
+        }
+        return jsonify(_make_json_serializable(response_data))
 
     except ValueError as e:
         return jsonify({"error": str(e)}), 422
@@ -200,7 +201,7 @@ def screen():
             summary = build_scenarios(financials, market_data)
             results.append(summary)
             try:
-                from supabase.client import save_valuation, save_market_snapshot
+                from db.supabase_client import save_valuation, save_market_snapshot
                 save_valuation(summary)
                 save_market_snapshot(summary)
             except Exception:
@@ -222,17 +223,17 @@ def screen():
 
     # Persist candidates
     try:
-        from supabase.client import save_research_candidates
+        from db.supabase_client import save_research_candidates
         save_research_candidates(candidates)
     except Exception:
         pass
 
-    return jsonify({
+    return jsonify(_make_json_serializable({
         "total_screened": len(results),
         "candidates": [_serialize_candidate(c) for c in candidates],
         "errors": errors,
         "screener_chart": screener_chart,
-    })
+    }))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,9 +243,9 @@ def screen():
 @app.route("/api/history/<ticker>")
 def history(ticker):
     try:
-        from supabase.client import load_valuation_history
+        from db.supabase_client import load_valuation_history
         rows = load_valuation_history(ticker.upper(), limit=90)
-        return jsonify({"ticker": ticker.upper(), "history": rows})
+        return jsonify(_make_json_serializable({"ticker": ticker.upper(), "history": rows}))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -252,9 +253,9 @@ def history(ticker):
 @app.route("/api/candidates")
 def candidates():
     try:
-        from supabase.client import load_recent_candidates
+        from db.supabase_client import load_recent_candidates
         rows = load_recent_candidates(days=7)
-        return jsonify({"candidates": rows})
+        return jsonify(_make_json_serializable({"candidates": rows}))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -326,7 +327,7 @@ def _run_ml(summary):
             return None
 
         p_score = load_or_train().score(fv)
-        stab = load_or_train_stab().predict(fv) if False else load_stab().predict(fv)
+        stab = load_stab().predict(fv)
         cluster = load_clust().predict(fv)
 
         return {
@@ -345,6 +346,24 @@ def _run_ml(summary):
     except Exception as e:
         logger.debug(f"ML assessment failed: {e}")
         return None
+
+
+def _make_json_serializable(obj):
+    """Recursively convert non-JSON-serializable types to native Python types."""
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_make_json_serializable(item) for item in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.bool_, np.integer, np.floating)):
+        return obj.item()
+    elif isinstance(obj, (bool, int, float, str, type(None))):
+        return obj
+    else:
+        return str(obj)
 
 
 def _fig_to_b64(fig) -> str:
@@ -417,7 +436,7 @@ def _generate_charts(summary, g_rates, d_rates, grid):
         ax.set_xlim(0, max(values) * 1.35)
         ax.set_title("DCF Fair Value by Scenario", color=TEXT, fontsize=11, pad=10)
         ax.legend(fontsize=9, facecolor=CARD, edgecolor="#2d3748", labelcolor=TEXT)
-        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:.0f}"))
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:.0f}"))
         ax.spines[:].set_visible(False)
         fig.tight_layout(pad=1.5)
         charts["scenarios"] = _fig_to_b64(fig)
@@ -458,7 +477,7 @@ def _generate_charts(summary, g_rates, d_rates, grid):
         ax.set_title("Free Cash Flow: History & Projections", color=TEXT, fontsize=11, pad=10)
         ax.set_xlabel("Year (0 = TTM)", color=MUTED)
         ax.set_ylabel("FCF ($M)", color=MUTED)
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}M"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}M"))
         ax.legend(fontsize=9, facecolor=CARD, edgecolor="#2d3748", labelcolor=TEXT)
         ax.spines[:].set_visible(False)
         ax.grid(True, alpha=0.3)
@@ -493,7 +512,7 @@ def _generate_charts(summary, g_rates, d_rates, grid):
         ax.set_title("Enterprise Value Composition", color=TEXT, fontsize=11, pad=10)
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}M"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"${x:,.0f}M"))
         ax.legend(fontsize=9, facecolor=CARD, edgecolor="#2d3748", labelcolor=TEXT)
         ax.spines[:].set_visible(False)
         ax.grid(True, alpha=0.3, axis="y")
@@ -556,7 +575,9 @@ def _screener_chart_b64(candidates):
     gaps    = [c.valuation_gap for c in candidates]
 
     norm = [(g - min(gaps)) / (max(gaps) - min(gaps) + 1e-9) for g in gaps]
-    colors = [plt.cm.RdYlGn(0.3 + 0.7 * n) for n in norm]
+    import matplotlib.cm as cm
+    cmap = cm.get_cmap("RdYlGn")
+    colors = [cmap(0.3 + 0.7 * n) for n in norm]
 
     fig, ax = plt.subplots(figsize=(8, max(3, len(candidates) * 0.55)), facecolor=BG)
     ax.set_facecolor(CARD)

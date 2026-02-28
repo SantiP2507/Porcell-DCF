@@ -128,7 +128,7 @@ def _load_real_training_data() -> dict:
     Requires at least MIN_REAL_SAMPLES rows to be useful.
     """
     try:
-        from supabase.client import _get_client
+        from db.supabase_client import _get_client
         from ml.bootstrap import FEATURE_NAMES
 
         client = _get_client()
